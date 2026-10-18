@@ -3,6 +3,7 @@ CW-SkyKick-IOC-*/
 *.csv
 Findings.json
 Report.html
+Summary.html
 
 # OS / editor
 .DS_Store

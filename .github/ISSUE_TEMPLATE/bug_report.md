@@ -12,6 +12,12 @@ labels: bug
 
 **Microsoft.Graph.Authentication version** (`Get-Module Microsoft.Graph.Authentication -ListAvailable`):
 
+**ExchangeOnlineManagement version** (only if you used `-IncludeExchange`):
+
+**Parameters used** (e.g. `-IncludeExchange -SkipAsnHunt`, no tenant names):
+
+**Coverage table** (copy the Check / Status columns from Report.html; they contain no tenant data):
+
 **What happened** (the error message, or the finding you believe is a false positive, redacted):
 
 **What you expected:**

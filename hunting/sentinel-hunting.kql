@@ -1,0 +1,106 @@
+// ConnectWise / SkyKick vendor-credential incident - Sentinel / Log Analytics hunting queries
+// Companion to Invoke-CWSkyKickIOCCheck.ps1 (v1.2.0). Run each query separately.
+//
+// These cover what the script cannot: Microsoft Graph reads (MicrosoftGraphActivityLogs), large tenants
+// where API sign-in queries hit their cap, and retention beyond what the Graph API returns.
+// Table and column names follow the Microsoft Entra / Graph diagnostic schemas. If a column is missing in
+// your workspace (schemas differ by connector version), adjust the column name.
+
+// ---------------------------------------------------------------------------------------------------
+// Shared indicators - paste this block in front of each query
+// ---------------------------------------------------------------------------------------------------
+let Lookback = datetime(2026-10-01);
+let AttackerIPs = dynamic(["144.172.64.128"]);
+let AttackerASNs = dynamic([14956]);                 // RouterHosting / Cloudzy
+// Optional: announced IPv4 prefixes of the attacker ASN, for tables without an ASN column.
+// Fill from https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS14956
+let AttackerRanges = dynamic([]);
+let VendorAppIds = dynamic([
+    "506e08f9-6e9a-4da4-942b-a099a03644ae", "2399d300-6fca-4e6a-a686-399fefe75b83",
+    "24205314-2b89-4e07-a2a4-579e898a5640", "b78f6a77-d4e5-46fb-87e5-d1648bd02519",
+    "0de14c77-b9b0-4137-9360-34878a929827", "412dcf96-176d-4b3a-a1b0-4981ad66971e",
+    "b2b55f5b-7758-4719-8d8f-88ae172e6bdb"]);
+
+// ---------------------------------------------------------------------------------------------------
+// 1. User sign-ins (interactive + non-interactive) from the attacker ASN or IPs
+//    Catches the password spray and any address rotation inside the same provider.
+// ---------------------------------------------------------------------------------------------------
+union isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
+| where TimeGenerated >= Lookback
+| where AutonomousSystemNumber in (AttackerASNs) or IPAddress in (AttackerIPs)
+| summarize Attempts = count(), Successes = countif(ResultType == "0"),
+            IPs = make_set(IPAddress, 50), Apps = make_set(AppDisplayName, 20), UserAgents = make_set(UserAgent, 20),
+            First = min(TimeGenerated), Last = max(TimeGenerated)
+    by UserPrincipalName, Type
+| order by Successes desc, Attempts desc
+
+// ---------------------------------------------------------------------------------------------------
+// 2. Service principal sign-ins from the attacker IPs / ranges, and vendor apps from anything but Azure ULA
+//    (AADServicePrincipalSignInLogs may not carry an ASN column in every workspace - hence the ranges.)
+// ---------------------------------------------------------------------------------------------------
+AADServicePrincipalSignInLogs
+| where TimeGenerated >= Lookback
+| extend IsAttacker = IPAddress in (AttackerIPs) or (array_length(AttackerRanges) > 0 and ipv4_is_in_any_range(IPAddress, AttackerRanges))
+| extend IsVendor = AppId in (VendorAppIds)
+| extend IsAzureUla = IPAddress startswith "fd" or IPAddress startswith "fc"
+| where IsAttacker or (IsVendor and not(IsAzureUla))
+| summarize SignIns = count(), Successes = countif(ResultType == "0"), IPs = make_set(IPAddress, 50),
+            Resources = make_set(ResourceDisplayName, 20), First = min(TimeGenerated), Last = max(TimeGenerated)
+    by ServicePrincipalName, AppId, IsVendor, IsAttacker
+| order by IsAttacker desc, Successes desc
+
+// ---------------------------------------------------------------------------------------------------
+// 3. Microsoft Graph activity logs: what the vendor apps or the attacker infrastructure actually READ
+//    This is the only source for app-only Graph reads. Requires MicrosoftGraphActivityLogs to have been
+//    streamed before the incident (Entra admin center > Diagnostic settings).
+// ---------------------------------------------------------------------------------------------------
+MicrosoftGraphActivityLogs
+| where TimeGenerated >= Lookback
+| where AppId in (VendorAppIds) or IPAddress in (AttackerIPs)
+       or (array_length(AttackerRanges) > 0 and ipv4_is_in_any_range(IPAddress, AttackerRanges))
+| extend Path = tostring(split(tostring(split(RequestUri, "?")[0]), "/v1.0/")[1])
+| extend Path = iff(isempty(Path), tostring(split(tostring(split(RequestUri, "?")[0]), "/beta/")[1]), Path)
+| extend Area = tostring(split(Path, "/")[0])
+| summarize Requests = count(), Writes = countif(RequestMethod != "GET"), Bytes = sum(ResponseSizeBytes),
+            IPs = make_set(IPAddress, 20), UserAgents = make_set(UserAgent, 10), SamplePaths = make_set(Path, 25),
+            First = min(TimeGenerated), Last = max(TimeGenerated)
+    by AppId, Area
+| order by Writes desc, Requests desc
+
+// 3b. Graph write calls by ANY app with a Python / curl user agent (credential planting, role changes)
+MicrosoftGraphActivityLogs
+| where TimeGenerated >= Lookback
+| where RequestMethod in ("POST", "PATCH", "PUT", "DELETE")
+| where UserAgent has_any ("Python-urllib", "python-requests", "curl/")
+| project TimeGenerated, AppId, ServicePrincipalId, IPAddress, RequestMethod, RequestUri, ResponseStatusCode, UserAgent
+| order by TimeGenerated asc
+
+// ---------------------------------------------------------------------------------------------------
+// 4. Entra audit: applications changing roles, credentials, users, policies or domain federation
+// ---------------------------------------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated >= Lookback
+| extend InitiatorApp = tostring(InitiatedBy.app.displayName), InitiatorAppId = tostring(InitiatedBy.app.appId),
+         InitiatorSpId = tostring(InitiatedBy.app.servicePrincipalId)
+| extend Details = tostring(AdditionalDetails)     // the User-Agent sits in AdditionalDetails
+| where isnotempty(InitiatorApp) or Details has_any ("Python-urllib", "python-requests", "curl/")
+| where OperationName has_any ("member to role", "Certificates and secrets", "service principal credentials",
+        "Add owner", "app role assignment", "Consent to application", "password", "security info",
+        "conditional access", "domain authentication", "federation", "Add user", "partner")
+| where InitiatorApp !in ("MS-PIM", "Azure AD PIM")
+| project TimeGenerated, OperationName, Result, InitiatorApp, InitiatorAppId, Details,
+          Targets = TargetResources, Category, CorrelationId
+| order by TimeGenerated asc
+
+// ---------------------------------------------------------------------------------------------------
+// 5. Microsoft 365 activity (mail, files, admin) from the attacker IPs / ranges
+//    OfficeActivity ClientIP can carry a port suffix; it is stripped before matching.
+// ---------------------------------------------------------------------------------------------------
+OfficeActivity
+| where TimeGenerated >= Lookback
+| extend Ip = extract(@"^\[?([0-9a-fA-F:\.]+?)\]?(:\d+)?$", 1, ClientIP)
+| where Ip in (AttackerIPs) or (array_length(AttackerRanges) > 0 and ipv4_is_in_any_range(Ip, AttackerRanges))
+| summarize Events = count(), Operations = make_set(Operation, 30), Objects = make_set(OfficeObjectId, 30),
+            First = min(TimeGenerated), Last = max(TimeGenerated)
+    by UserId, Ip, OfficeWorkload
+| order by Events desc
