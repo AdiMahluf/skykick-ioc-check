@@ -1,0 +1,10 @@
+# Security
+
+## Reporting a problem with the script
+If you find a bug that could cause the script to change something it should not, or to miss a known indicator, open an issue or contact the maintainer privately through GitHub.
+
+## Do not share tenant data
+The script output (CSV, JSON, HTML) contains tenant IDs, application IDs, user names, IP addresses and audit events. Never post it in issues, pull requests or discussions. Redact anything you share.
+
+## Reporting the incident itself
+This project does not handle incident reports. Contact ConnectWise, Huntress, Microsoft or your incident response provider.

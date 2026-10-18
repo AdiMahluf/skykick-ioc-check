@@ -1,0 +1,11 @@
+# Script output - contains sensitive tenant data, never commit
+CW-SkyKick-IOC-*/
+*.csv
+Findings.json
+Report.html
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
